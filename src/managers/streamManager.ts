@@ -92,7 +92,13 @@ export class RoomManager {
     public subscriber : RedisClientType;
     public wsToSpace : Map<WebSocket, string>
     private timestampIntervals: Map<string, NodeJS.Timeout> = new Map();
-    private readonly TIMESTAMP_BROADCAST_INTERVAL = 5000; // Broadcast every 5 seconds
+    private microSyncIntervals: Map<string, NodeJS.Timeout> = new Map();
+    private networkLatency: Map<string, number[]> = new Map(); // Track network latency per space
+    private adaptiveSyncIntervals: Map<string, number> = new Map(); // Dynamic sync intervals
+    private readonly TIMESTAMP_BROADCAST_INTERVAL = 1000; // Broadcast every 1 second for better sync
+    private readonly MICRO_SYNC_INTERVAL = 200; // Micro-sync every 200ms for ultra-fast sync
+    private readonly ADAPTIVE_SYNC_MAX = 500; // Maximum adaptive sync interval
+    private readonly ADAPTIVE_SYNC_MIN = 100; // Minimum adaptive sync interval
 
     
     private constructor() {
@@ -273,13 +279,15 @@ export class RoomManager {
           
           await this.sendRoomInfoToUser(spaceId, userId);
           
+          // Send current playing song first before other updates
+          await this.sendCurrentPlayingSongToUser(spaceId, userId);
+          
           await this.broadcastUserUpdate(spaceId);
           
           await this.sendCurrentQueueToUser(spaceId, userId);
           
+          // Sync playback state after song is loaded
           await this.syncNewUserToPlayback(spaceId, userId);
-          
-          await this.sendCurrentPlayingSongToUser(spaceId, userId);
         } else {
           throw new Error("Failed to add user to space");
         }
@@ -424,8 +432,8 @@ export class RoomManager {
                 duration: nextSong.duration || undefined,
                 extractedId: nextSong.extractedId
             },
-            startedAt: 0, // Will be set when admin starts playback
-            pausedAt: null,
+            startedAt: now, // Start tracking time immediately
+            pausedAt: now,  // But start paused
             isPlaying: false, // Always start paused
             lastUpdated: now
         };
@@ -584,6 +592,7 @@ export class RoomManager {
         }
     }
     private startTimestampBroadcast(spaceId: string) {
+        console.log(`[Timestamp] Starting timestamp broadcast for space ${spaceId}`);
         this.stopTimestampBroadcast(spaceId);
         
         const interval = setInterval(async () => {
@@ -591,19 +600,139 @@ export class RoomManager {
         }, this.TIMESTAMP_BROADCAST_INTERVAL);
         
         this.timestampIntervals.set(spaceId, interval);
+        
+        // Start micro-sync for ultra-fast synchronization
+        this.startMicroSync(spaceId);
+        
+        console.log(`[Timestamp] Timestamp broadcast interval set for space ${spaceId}`);
     }
 
     private stopTimestampBroadcast(spaceId: string) {
         const interval = this.timestampIntervals.get(spaceId);
         if (interval) {
+            console.log(`[Timestamp] Stopping timestamp broadcast for space ${spaceId}`);
             clearInterval(interval);
             this.timestampIntervals.delete(spaceId);
         }
+        
+        // Stop micro-sync
+        this.stopMicroSync(spaceId);
+    }
+
+    // Calculate adaptive sync interval based on network conditions and user count
+    private calculateAdaptiveInterval(spaceId: string): number {
+        const space = this.spaces.get(spaceId);
+        if (!space) return this.MICRO_SYNC_INTERVAL;
+
+        const userCount = space.users.size;
+        const latencyHistory = this.networkLatency.get(spaceId) || [];
+        
+        // Base interval adjusted for user count (more users = slower sync to reduce load)
+        let interval = this.MICRO_SYNC_INTERVAL + (userCount * 20);
+        
+        // Adjust for network conditions
+        if (latencyHistory.length > 0) {
+            const avgLatency = latencyHistory.reduce((a, b) => a + b, 0) / latencyHistory.length;
+            
+            // Higher latency = longer intervals to prevent message queuing
+            if (avgLatency > 500) interval += 100;
+            else if (avgLatency > 200) interval += 50;
+            else if (avgLatency < 50) interval -= 30; // Low latency = faster sync possible
+        }
+        
+        // Clamp to reasonable bounds
+        return Math.max(this.ADAPTIVE_SYNC_MIN, Math.min(this.ADAPTIVE_SYNC_MAX, interval));
+    }
+
+    // Update network latency tracking
+    private updateNetworkLatency(spaceId: string, latency: number): void {
+        const history = this.networkLatency.get(spaceId) || [];
+        history.push(latency);
+        
+        // Keep only last 10 measurements
+        if (history.length > 10) {
+            history.shift();
+        }
+        
+        this.networkLatency.set(spaceId, history);
+        
+        // Update adaptive interval
+        const newInterval = this.calculateAdaptiveInterval(spaceId);
+        this.adaptiveSyncIntervals.set(spaceId, newInterval);
+    }
+
+    private startMicroSync(spaceId: string) {
+        this.stopMicroSync(spaceId);
+        
+        // Use adaptive interval for optimal performance
+        const adaptiveInterval = this.calculateAdaptiveInterval(spaceId);
+        this.adaptiveSyncIntervals.set(spaceId, adaptiveInterval);
+        
+        const microInterval = setInterval(async () => {
+            await this.broadcastMicroSync(spaceId);
+        }, adaptiveInterval);
+        
+        this.microSyncIntervals.set(spaceId, microInterval);
+        console.log(`[AdaptiveSync] Started micro-sync for space ${spaceId} with ${adaptiveInterval}ms interval`);
+    }
+
+    private stopMicroSync(spaceId: string) {
+        const interval = this.microSyncIntervals.get(spaceId);
+        if (interval) {
+            clearInterval(interval);
+            this.microSyncIntervals.delete(spaceId);
+            
+            // Clean up adaptive sync data
+            this.networkLatency.delete(spaceId);
+            this.adaptiveSyncIntervals.delete(spaceId);
+            
+            console.log(`[AdaptiveSync] Stopped micro-sync and cleaned up adaptive data for space ${spaceId}`);
+        }
+    }
+
+    private async broadcastMicroSync(spaceId: string) {
+        const space = this.spaces.get(spaceId);
+        if (!space || !space.playbackState.currentSong || !space.playbackState.isPlaying) {
+            return; // Only micro-sync when actively playing
+        }
+
+        const now = Date.now();
+        const { playbackState } = space;
+        
+        // Additional null check for TypeScript
+        if (!playbackState.currentSong) {
+            return;
+        }
+        
+        let currentTime = 0;
+        if (playbackState.startedAt > 0 && playbackState.isPlaying) {
+            currentTime = (now - playbackState.startedAt) / 1000;
+        }
+
+        // Lightweight micro-sync data
+        const microSyncData = {
+            ct: Math.max(0, currentTime), // current time (abbreviated for speed)
+            ts: now, // timestamp
+            si: playbackState.currentSong.id, // song id
+        };
+
+        // Send to all users with minimal overhead
+        space.users.forEach((user) => {
+            user.ws.forEach((ws: WebSocket) => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: "micro-sync",
+                        data: microSyncData
+                    }));
+                }
+            });
+        });
     }
 
     private async broadcastCurrentTimestamp(spaceId: string) {
         const space = this.spaces.get(spaceId);
         if (!space || !space.playbackState.currentSong) {
+            console.log(`[Timestamp] No space or current song for ${spaceId}, skipping broadcast`);
             return;
         }
 
@@ -633,23 +762,39 @@ export class RoomManager {
             totalDuration: playbackState.currentSong?.duration
         };
 
+        console.log(`[Timestamp] Broadcasting to ${space.users.size} users in space ${spaceId}:`, {
+            currentTime: timestampData.currentTime,
+            isPlaying: timestampData.isPlaying,
+            songId: timestampData.songId
+        });
+
+        let broadcastCount = 0;
         space.users.forEach((user) => {
             user.ws.forEach((ws: WebSocket) => {
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({
-                        type: "timestamp-sync",
+                        type: "playback-state-update",
                         data: timestampData
                     }));
+                    broadcastCount++;
                 }
             });
         });
 
-        // Also store in Redis for new users joining
-        await this.redisClient.set(
-            `timestamp-${spaceId}`,
-            JSON.stringify(timestampData),
-            { EX: 10 } // Expire after 10 seconds
-        );
+        console.log(`[Timestamp] Broadcast sent to ${broadcastCount} connections`);
+
+        // Only store in Redis occasionally to reduce overhead (every 5th broadcast)
+        if (Math.floor(now / 1000) % 5 === 0) {
+            try {
+                await this.redisClient.set(
+                    `timestamp-${spaceId}`,
+                    JSON.stringify(timestampData),
+                    { EX: 10 } // Expire after 10 seconds
+                );
+            } catch (error) {
+                console.error(`[Timestamp] Error storing timestamp in Redis:`, error);
+            }
+        }
     }
 
     async sendCurrentTimestampToUser(spaceId: string, userId: string) {
@@ -688,7 +833,7 @@ export class RoomManager {
         user.ws.forEach((ws: WebSocket) => {
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
-                    type: "timestamp-sync",
+                    type: "playback-state-update",
                     data: {
                         ...timestampData,
                         isInitialSync: true // Flag for new joiners
@@ -719,8 +864,8 @@ export class RoomManager {
             user.ws.forEach((ws: WebSocket) => {
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({
-                        type: "play",
-                        data: { spaceId, userId }
+                        type: "playback-resumed",
+                        data: { spaceId, userId, timestamp: now }
                     }));
                 }
             });
@@ -728,7 +873,16 @@ export class RoomManager {
 
         this.startTimestampBroadcast(spaceId);
 
+        // Immediate sync broadcast for instant response
         await this.broadcastCurrentTimestamp(spaceId);
+        
+        // Trigger immediate micro-sync burst for ultra-fast sync
+        setTimeout(async () => {
+            await this.broadcastMicroSync(spaceId);
+        }, 50);
+        setTimeout(async () => {
+            await this.broadcastMicroSync(spaceId);
+        }, 100);
     }
 
     async handlePlaybackPause(spaceId: string, userId: string) {
@@ -745,8 +899,8 @@ export class RoomManager {
             user.ws.forEach((ws: WebSocket) => {
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({
-                        type: "pause",
-                        data: { spaceId, userId }
+                        type: "playback-paused",
+                        data: { spaceId, userId, timestamp: now }
                     }));
                 }
             });
@@ -755,6 +909,11 @@ export class RoomManager {
         this.stopTimestampBroadcast(spaceId);
 
         await this.broadcastCurrentTimestamp(spaceId);
+        
+        // Immediate sync for pause events
+        setTimeout(async () => {
+            await this.broadcastCurrentTimestamp(spaceId);
+        }, 50);
     }
 
     async handlePlaybackSeek(spaceId: string, userId: string, seekTime: number) {        
@@ -777,11 +936,13 @@ export class RoomManager {
             user.ws.forEach((ws: WebSocket) => {
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({
-                        type: "seek",
+                        type: "playback-seeked",
                         data: { 
+                            seekTime: seekTime,
                             currentTime: seekTime,
                             spaceId: spaceId,
                             triggeredBy: userId,
+                            timestamp: now,
                             forceSync: true // Flag to indicate this is a forced sync
                         }
                     }));
@@ -798,10 +959,34 @@ export class RoomManager {
 
     async syncNewUserToPlayback(spaceId: string, userId: string) {
         try {
-            // Small delay to ensure current song is sent first
+            console.log(`[Sync] Starting playback sync for new user ${userId} in space ${spaceId}`);
+            
+            // Send current song first, then sync playback state
             setTimeout(async () => {
+                console.log(`[Sync] Sending timestamp sync to user ${userId}`);
                 await this.sendCurrentTimestampToUser(spaceId, userId);
-            }, 100);
+                
+                // Also trigger image update after a short delay
+                setTimeout(async () => {
+                    const imageUrl = await this.getCurrentSpaceImage(spaceId);
+                    if (imageUrl) {
+                        const user = this.users.get(userId);
+                        if (user) {
+                            user.ws.forEach((ws: WebSocket) => {
+                                if (ws.readyState === WebSocket.OPEN) {
+                                    ws.send(JSON.stringify({
+                                        type: "space-image-response",
+                                        data: { 
+                                            spaceId: spaceId,
+                                            imageUrl: imageUrl
+                                        }
+                                    }));
+                                }
+                            });
+                        }
+                    }
+                }, 200);
+            }, 150); // Slightly longer delay to ensure song is processed first
         } catch (error) {
             console.error(`Error syncing user ${userId} to playback:`, error);
         }
@@ -968,29 +1153,122 @@ export class RoomManager {
 
     async sendCurrentPlayingSongToUser(spaceId: string, userId: string) {
         const user = this.users.get(userId);
-        if (!user) return;
+        const space = this.spaces.get(spaceId);
+        if (!user || !space) return;
         
         try {
-            const currentSong = await this.getCurrentPlayingSong(spaceId);
+            // First check in-memory playback state
+            let currentSong = null;
+            let isPlaying = false;
+            let currentTime = 0;
+            
+            if (space.playbackState.currentSong) {
+                // Get current song from in-memory state
+                const now = Date.now();
+                const { playbackState } = space;
+                const currentSongState = playbackState.currentSong; // Store reference for null safety
+                
+                if (!currentSongState) {
+                    // Double check - if null, skip to Redis fallback
+                    const redisSong = await this.getCurrentPlayingSong(spaceId);
+                    if (redisSong) {
+                        currentSong = {
+                            ...redisSong,
+                            voteCount: await this.getSongVoteCount(spaceId, redisSong.id)
+                        };
+                    }
+                } else {
+                    if (playbackState.startedAt > 0) {
+                        if (playbackState.isPlaying) {
+                            currentTime = (now - playbackState.startedAt) / 1000;
+                        } else if (playbackState.pausedAt) {
+                            currentTime = (playbackState.pausedAt - playbackState.startedAt) / 1000;
+                        }
+                    }
+                    
+                    // Get full song data from Redis to ensure we have all details including images
+                    const redisSong = await this.getCurrentPlayingSong(spaceId);
+                    
+                    currentSong = {
+                        id: currentSongState.id,
+                        title: currentSongState.title,
+                        artist: currentSongState.artist,
+                        url: currentSongState.url,
+                        duration: currentSongState.duration,
+                        extractedId: currentSongState.extractedId,
+                        // Include image data from Redis if available
+                        smallImg: redisSong?.smallImg || '',
+                        bigImg: redisSong?.bigImg || '',
+                        userId: redisSong?.userId || '',
+                        addedByUser: redisSong?.addedByUser || 'Unknown',
+                        source: redisSong?.source || 'Youtube',
+                        addedAt: redisSong?.addedAt || Date.now(),
+                        voteCount: await this.getSongVoteCount(spaceId, currentSongState.id)
+                    };
+                    
+                    isPlaying = playbackState.isPlaying;
+                }
+            } else {
+                // Fallback to Redis if no in-memory state
+                const redisSong = await this.getCurrentPlayingSong(spaceId);
+                if (redisSong) {
+                    currentSong = {
+                        ...redisSong,
+                        voteCount: await this.getSongVoteCount(spaceId, redisSong.id)
+                    };
+                }
+            }
             
             if (currentSong) {
                 const songData = {
                     ...currentSong,
-                    voteCount: await this.getSongVoteCount(spaceId, currentSong.id),
                     addedByUser: {
                         id: currentSong.userId,
                         name: currentSong.addedByUser
                     }
                 };
                 
+                console.log(`[CurrentSong] Sending current song to new user ${userId}:`, {
+                    songId: currentSong.id,
+                    title: currentSong.title,
+                    hasImages: !!(currentSong.smallImg || currentSong.bigImg),
+                    isPlaying: isPlaying,
+                    currentTime: Math.max(0, currentTime)
+                });
+                
                 user.ws.forEach((ws: WebSocket) => {
                     if (ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({
                             type: "current-song-update",
-                            data: { song: songData }
+                            data: { 
+                                song: songData,
+                                playbackState: {
+                                    isPlaying: isPlaying,
+                                    currentTime: Math.max(0, currentTime),
+                                    timestamp: Date.now()
+                                }
+                            }
                         }));
                     }
                 });
+                
+                // Also send image update separately to ensure it's received
+                const imageUrl = currentSong.bigImg || currentSong.smallImg;
+                if (imageUrl) {
+                    user.ws.forEach((ws: WebSocket) => {
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: "space-image-response",
+                                data: { 
+                                    spaceId: spaceId,
+                                    imageUrl: imageUrl
+                                }
+                            }));
+                        }
+                    });
+                }
+            } else {
+                console.log(`[CurrentSong] No current song found for space ${spaceId}`);
             }
         } catch (error) {
             console.error("Error sending current playing song to user:", error);
@@ -1233,16 +1511,32 @@ async getSongById(spaceId: string, songId: string): Promise<QueueSong | null> {
 
     async getCurrentSpaceImage(spaceId: string): Promise<string | null> {
         try {
-            const currentSong = await this.getCurrentPlayingSong(spaceId);
+            // First check in-memory state for current song
+            const space = this.spaces.get(spaceId);
+            if (space?.playbackState.currentSong) {
+                // Check if we have image in in-memory state, but get from Redis for full data
+                const currentSong = await this.getCurrentPlayingSong(spaceId);
+                if (currentSong && (currentSong.bigImg || currentSong.smallImg)) {
+                    console.log(`[SpaceImage] Found image from current song: ${currentSong.title}`);
+                    return currentSong.bigImg || currentSong.smallImg;
+                }
+            }
             
+            // Fallback to Redis current song
+            const currentSong = await this.getCurrentPlayingSong(spaceId);
             if (currentSong && (currentSong.bigImg || currentSong.smallImg)) {
+                console.log(`[SpaceImage] Found image from Redis current song: ${currentSong.title}`);
                 return currentSong.bigImg || currentSong.smallImg;
             }
+            
+            // Last resort: check the queue
             const queue = await this.getRedisQueue(spaceId);
             if (queue.length > 0 && (queue[0].bigImg || queue[0].smallImg)) {
+                console.log(`[SpaceImage] Found image from queue first song: ${queue[0].title}`);
                 return queue[0].bigImg || queue[0].smallImg;
             }
             
+            console.log(`[SpaceImage] No image found for space ${spaceId}`);
             return null;
         } catch (error) {
             console.error('Error getting current space image:', error);
@@ -1547,9 +1841,9 @@ async getSongById(spaceId: string, songId: string): Promise<QueueSong | null> {
                 duration: nextSong.duration,
                 extractedId: nextSong.extractedId
             },
-            startedAt: 0, // Will be set when admin starts playback
+            startedAt: now, // Start immediately for auto-play
             pausedAt: null,
-            isPlaying: false, // Always start paused
+            isPlaying: true, // Auto-start the next song
             lastUpdated: now
         };
 
@@ -1570,6 +1864,23 @@ async getSongById(spaceId: string, songId: string): Promise<QueueSong | null> {
                     ws.send(JSON.stringify({
                         type: "current-song-update",
                         data: { song: songData }
+                    }));
+                }
+            });
+        });
+
+        // Send playback-resumed message to auto-start the song
+        space.users.forEach((user) => {
+            user.ws.forEach((ws: WebSocket) => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: "playback-resumed",
+                        data: { 
+                            spaceId, 
+                            userId,
+                            timestamp: now,
+                            autoPlay: true // Flag to indicate this is auto-play
+                        }
                     }));
                 }
             });
@@ -1728,6 +2039,28 @@ async getSongById(spaceId: string, songId: string): Promise<QueueSong | null> {
     }
 
     // Helper method to get user info from Redis
+    // Handle latency feedback from frontend
+    async reportLatency(spaceId: string, userId: string, latency: number) {
+        const space = this.spaces.get(spaceId);
+        if (!space) {
+            console.log(`[Latency] Space ${spaceId} not found for latency report`);
+            return;
+        }
+
+        // Update network latency tracking
+        this.updateNetworkLatency(spaceId, latency);
+        
+        // Adjust sync intervals based on new latency data
+        const currentInterval = this.adaptiveSyncIntervals.get(spaceId) || this.MICRO_SYNC_INTERVAL;
+        const newInterval = this.calculateAdaptiveInterval(spaceId);
+        
+        // If interval needs significant adjustment, restart micro-sync
+        if (Math.abs(currentInterval - newInterval) > 50) {
+            console.log(`[AdaptiveSync] Adjusting sync interval from ${currentInterval}ms to ${newInterval}ms for space ${spaceId}`);
+            this.startMicroSync(spaceId);
+        }
+    }
+
     async getUserInfo(userId: string): Promise<{ username?: string; email?: string; name?: string } | null> {
         try {
             const userInfo = await this.redisClient.get(`user-info-${userId}`);

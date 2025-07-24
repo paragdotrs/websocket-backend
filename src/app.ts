@@ -49,6 +49,7 @@ type Data = {
     autoPlay? : boolean;
     seekTime? : number;
     currentTime? : number;
+    latency? : number;
 }
 
 
@@ -263,6 +264,28 @@ async function  processUserAction(type: string , data : Data ) {
             } else {
                 console.error(`❌ User not found when requesting space image. UserId: ${data.userId}, SpaceId: ${data.spaceId}`);
 
+            }
+            break;
+
+        case "song-ended":
+            console.log("[Backend] Song ended, playing next from queue");
+            try {
+                await RoomManager.getInstance().playNextFromRedisQueue(data.spaceId, data.userId);
+            } catch (error) {
+                console.error("Error playing next song after current ended:", error);
+            }
+            break;
+            
+        case "latency-report":
+            console.log(`[Latency] Received latency report from user ${data.userId}:`, data.latency, "ms");
+            try {
+                if (typeof data.latency === 'number') {
+                    await RoomManager.getInstance().reportLatency(data.spaceId, data.userId, data.latency);
+                } else {
+                    console.error("Invalid latency value:", data.latency);
+                }
+            } catch (error) {
+                console.error("Error processing latency report:", error);
             }
             break;
     
