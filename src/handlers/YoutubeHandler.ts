@@ -1,8 +1,7 @@
 import { MusicHandler, MusicSource, MusicTrack } from "../types";
 //@ts-ignore
 import youtubesearchapi from "youtube-search-api";
-
-
+import * as crypto from 'crypto';
 export class YoutubeHandler implements MusicHandler {
     validateURL(URL: string): boolean {
         if (!URL) return false;
