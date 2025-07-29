@@ -2,6 +2,7 @@ import { Worker } from 'worker_threads';
 import { EventEmitter } from 'events';
 import * as path from 'path';
 import * as os from 'os';
+import * as fs from 'fs';
 
 export interface WorkerTask {
     id: string;
@@ -44,7 +45,40 @@ export class MusicWorkerPool extends EventEmitter {
     constructor(maxWorkers?: number) {
         super();
         this.maxWorkers = maxWorkers || Math.min(Math.max(os.cpus().length - 1, 2), 8);
-        this.workerScript = path.resolve(__dirname, '../workers/musicWorker.ts');
+        
+        // Determine the correct worker script path based on environment
+        // Check multiple possible locations
+        const possiblePaths = [
+            // Production paths (compiled)
+            path.resolve(__dirname, 'musicWorker.js'),
+            path.resolve(__dirname, './musicWorker.js'),
+            // Development paths (source)
+            path.resolve(__dirname, '../workers/musicWorker.ts'),
+            path.resolve(__dirname, './musicWorker.ts'),
+            // Fallback paths
+            path.join(__dirname, 'musicWorker.js'),
+            path.join(__dirname, '..', 'workers', 'musicWorker.ts')
+        ];
+        
+        let foundPath = null;
+        for (const possiblePath of possiblePaths) {
+            if (fs.existsSync(possiblePath)) {
+                foundPath = possiblePath;
+                break;
+            }
+        }
+        
+        if (foundPath) {
+            this.workerScript = foundPath;
+            console.log(`[WorkerPool] Found worker script: ${this.workerScript}`);
+        } else {
+            // Last resort - use the most likely production path
+            this.workerScript = path.resolve(__dirname, 'musicWorker.js');
+            console.error(`[WorkerPool] ❌ Worker script not found in any expected location. Using fallback: ${this.workerScript}`);
+            console.error(`[WorkerPool] __dirname: ${__dirname}`);
+            console.error(`[WorkerPool] Searched paths:`, possiblePaths);
+        }
+        
         console.log(`[WorkerPool] Initializing with ${this.maxWorkers} workers`);
         this.initializeWorkers();
     }
@@ -58,10 +92,31 @@ export class MusicWorkerPool extends EventEmitter {
 
     private createWorker(workerId: number): Worker {
         try {
-            const worker = new Worker(this.workerScript, {
-                workerData: { workerId },
-                execArgv: ['--require', 'ts-node/register']
-            });
+            console.log(`[WorkerPool] Creating worker ${workerId} with script: ${this.workerScript}`);
+            
+            // Check if the worker script file exists
+            if (!fs.existsSync(this.workerScript)) {
+                throw new Error(`Worker script not found: ${this.workerScript}`);
+            }
+            
+            // Check if we're using the compiled version or source version
+            const isCompiledVersion = this.workerScript.endsWith('.js');
+            
+            let worker: Worker;
+            if (isCompiledVersion) {
+                // Use compiled .js file without ts-node
+                console.log(`[WorkerPool] Using compiled worker (no ts-node): ${this.workerScript}`);
+                worker = new Worker(this.workerScript, {
+                    workerData: { workerId }
+                });
+            } else {
+                // Use TypeScript source file with ts-node
+                console.log(`[WorkerPool] Using TypeScript worker (with ts-node): ${this.workerScript}`);
+                worker = new Worker(this.workerScript, {
+                    workerData: { workerId },
+                    execArgv: ['--require', 'ts-node/register']
+                });
+            }
             
             worker.on('message', (result) => {
                 const task = this.workerTasks.get(worker);
@@ -84,16 +139,16 @@ export class MusicWorkerPool extends EventEmitter {
 
             this.workers.push(worker);
             this.availableWorkers.push(worker);
-            
+
             console.log(`[WorkerPool] ✅ Worker ${workerId} created and ready`);
             return worker;
         } catch (error) {
             console.error(`[WorkerPool] ❌ Failed to create worker ${workerId}:`, error);
+            console.error(`[WorkerPool] Worker script path: ${this.workerScript}`);
+            console.error(`[WorkerPool] __dirname: ${__dirname}`);
             throw error;
         }
-    }
-
-    private handleWorkerResponse(worker: Worker, task: WorkerTask, result: any): void {
+    }    private handleWorkerResponse(worker: Worker, task: WorkerTask, result: any): void {
         const processingTime = Date.now() - task.timestamp;
         
         // Clear timeout
