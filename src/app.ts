@@ -50,6 +50,22 @@ type Data = {
     seekTime? : number;
     currentTime? : number;
     latency? : number;
+    // Batch processing fields - updated for simplified track metadata format
+    songs? : Array<{ 
+        title: string; 
+        artist: string; 
+        album?: string; 
+        spotifyId?: string; 
+        spotifyUrl?: string; 
+        smallImg?: string; 
+        bigImg?: string; 
+        duration?: number; 
+        source: string;
+        // Legacy support
+        url?: string; 
+        extractedId?: string; 
+        trackData?: any;
+    }>;
 }
 
 
@@ -57,7 +73,7 @@ function createHttpServer() {
     return http.createServer((req , res)=> {
         res.statusCode = 200;
         res.setHeader("Content-Type" , "text/plain")
-        res.end("Hello From the websocket server mkc tera bhai seedhe maut ")
+        res.end("🎵 Deciball WebSocket Server - Optimized Music Processing System 🚀")
     })
 }
 
@@ -77,12 +93,15 @@ async function handleJoinRoom(ws: WebSocket , data : Data){
         process.env.JWT_SECRET as string,
         async (err : any , decoded : any) => {
             if(err){
-                console.log("JWT verification error:", err)
+                console.log("JWT verification error:", err.message || err)
                 sendError(ws , "Token verification failed")
+                return; // Add return to prevent further execution
             } else {
                 
                 const creatorId = decoded.creatorId || decoded.userId;
                 const userId = decoded.userId;
+                
+                console.log("JWT verified successfully for user:", userId);
                 
                 try {
                     await RoomManager.getInstance().joinRoom(
@@ -129,13 +148,84 @@ async function  processUserAction(type: string , data : Data ) {
             break;
         
         case "add-to-queue":
-            await RoomManager.getInstance().addToQueueRedis(
-                  data.spaceId,
-                  data.userId,
-                  data.url,
-                  data.trackData, // Pass additional track data
-                  data.autoPlay  // Pass auto-play flag
+            // Use the new optimized processing system
+            await RoomManager.getInstance().processNewStream(
+                data.spaceId,
+                data.url,
+                data.userId,
+                data.trackData,
+                data.autoPlay || false
             );
+            break;
+
+        case "add-batch-to-queue":
+            // Handle both old and new batch processing formats
+            if (data.songs && Array.isArray(data.songs)) {
+                // Check if this is the new simplified format (has title/artist fields)
+                const isSimplifiedFormat = data.songs.length > 0 && 
+                    data.songs[0].title && data.songs[0].artist && !data.songs[0].url;
+
+                if (isSimplifiedFormat) {
+                    // New simplified format - search YouTube using worker pool
+                    console.log(`[App] Processing ${data.songs.length} simplified tracks for YouTube search`);
+                    const result = await RoomManager.getInstance().processSimplifiedBatch(
+                        data.spaceId,
+                        data.songs as Array<{ 
+                            title: string; 
+                            artist: string; 
+                            album?: string; 
+                            spotifyId?: string; 
+                            spotifyUrl?: string; 
+                            smallImg?: string; 
+                            bigImg?: string; 
+                            duration?: number; 
+                            source: string;
+                        }>,
+                        data.userId,
+                        data.autoPlay || false
+                    );
+                    
+                    // Send batch result back to user
+                    const user = RoomManager.getInstance().users.get(data.userId);
+                    if (user) {
+                        user.ws.forEach((ws: WebSocket) => {
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({
+                                    type: "batch-processing-result",
+                                    data: result
+                                }));
+                            }
+                        });
+                    }
+                } else {
+                    // Legacy format - use existing method
+                    console.log(`[App] Processing ${data.songs.length} legacy format tracks`);
+                    const result = await RoomManager.getInstance().processBatchStreams(
+                        data.spaceId,
+                        data.songs as Array<{ 
+                            url: string; 
+                            source?: string; 
+                            extractedId?: string; 
+                            trackData?: any;
+                        }>,
+                        data.userId,
+                        data.autoPlay || false
+                    );
+                    
+                    // Send batch result back to user
+                    const user = RoomManager.getInstance().users.get(data.userId);
+                    if (user) {
+                        user.ws.forEach((ws: WebSocket) => {
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({
+                                    type: "batch-processing-result",
+                                    data: result
+                                }));
+                            }
+                        });
+                    }
+                }
+            }
             break;
 
         case "play-next":
@@ -152,6 +242,7 @@ async function  processUserAction(type: string , data : Data ) {
             } catch (err) {
                 console.error("Error while playing websocket server::",  err)
             }
+            break;
         case "remove-song":
             const removed = await RoomManager.getInstance().removeSongFromRedisQueue(data.spaceId, data.streamId);
             if (removed) {
@@ -288,6 +379,26 @@ async function  processUserAction(type: string , data : Data ) {
                 console.error("Error processing latency report:", error);
             }
             break;
+
+        // case "get-system-stats":
+        //     // New system statistics endpoint
+        //     try {
+        //         const stats = await RoomManager.getInstance().getSystemStats();
+        //         const user = RoomManager.getInstance().users.get(data.userId);
+        //         if (user) {
+        //             user.ws.forEach((ws: WebSocket) => {
+        //                 if (ws.readyState === WebSocket.OPEN) {
+        //                     ws.send(JSON.stringify({
+        //                         type: "system-stats-response",
+        //                         data: stats
+        //                     }));
+        //                 }
+        //             });
+        //         }
+        //     } catch (error) {
+        //         console.error("Error getting system stats:", error);
+        //     }
+        //     break;
     
         default:
             console.warn("Unknown message type:" , type);
@@ -307,21 +418,29 @@ async function handleUserAction(ws:WebSocket , type : string , data : Data) {
 }
 
 async function handleConnection(ws:WebSocket) {
+    console.log("WebSocket connection established, waiting for messages...");
+    
     ws.on("message" , async (raw : {toString : ()=> string}) => {
-        console.log(`Received: ${raw}`);
-        const {type , data} = JSON.parse(raw.toString()) || {};
+        try {
+            console.log(`Received: ${raw}`);
+            const {type , data} = JSON.parse(raw.toString()) || {};
+            console.log("Parsed message type:", type, "data keys:", Object.keys(data || {}));
 
-        switch (type){
-            case "join-room":
-                await handleJoinRoom(ws , data);
-                break;
-            case "discord-activity-update":
-                await RoomManager.getInstance().broadcastDiscordActivity(data.spaceId, data);
-                break;
-            default:
-                await handleUserAction(ws , type , data)
+            switch (type){
+                case "join-room":
+                    await handleJoinRoom(ws , data);
+                    break;
+                case "discord-activity-update":
+                    await RoomManager.getInstance().broadcastDiscordActivity(data.spaceId, data);
+                    break;
+                default:
+                    await handleUserAction(ws , type , data)
+            }
+        } catch (error) {
+            console.error("Error processing message:", error);
+            sendError(ws, "Failed to process message");
         }
-    } )
+    });
 
 
     ws.on("error", (err : any) => {
@@ -345,16 +464,72 @@ async function main() {
     console.log("heii")
     await RoomManager.getInstance().initRedisClient();
     console.log("byeee")
-    wss.on("connection", (ws) => {
-        console.log(" New WebSocket connection established.");
-        handleConnection(ws)
-    }
-    );
+    wss.on("connection", (ws, req) => {
+        const clientIp = req.socket.remoteAddress;
+        console.log(`New WebSocket connection established from ${clientIp}`);
+        
+        // Send a ping every 30 seconds to keep connection alive
+        const pingInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.ping();
+            } else {
+                clearInterval(pingInterval);
+            }
+        }, 30000);
+        
+        ws.on('close', () => {
+            clearInterval(pingInterval);
+        });
+        
+        handleConnection(ws);
+    });
     // wss.on("connection", (ws)=> handleConnection(ws))
 
     const PORT = process.env.PORT ?? 8080;
     server.listen(PORT , ()=> {
         console.log(`${process.pid} : Websocket server is running on ${PORT} `)
     })
+
+    // Graceful shutdown handling
+    const gracefulShutdown = async (signal: string) => {
+        console.log(`\n[${signal}] Received shutdown signal, starting graceful shutdown...`);
+        
+        try {
+            // Close WebSocket server
+            wss.close(() => {
+                console.log('✅ WebSocket server closed');
+            });
+            
+            // Close HTTP server
+            server.close(() => {
+                console.log('✅ HTTP server closed');
+            });
+            
+            // Shutdown RoomManager (includes worker pool and Redis)
+            await RoomManager.getInstance().shutdown();
+            
+            console.log('✅ Graceful shutdown completed');
+            process.exit(0);
+        } catch (error) {
+            console.error('❌ Error during graceful shutdown:', error);
+            process.exit(1);
+        }
+    };
+
+    // Handle shutdown signals
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    process.on('SIGUSR2', () => gracefulShutdown('SIGUSR2')); // For nodemon
+
+    // Handle uncaught exceptions
+    process.on('uncaughtException', (error) => {
+        console.error('❌ Uncaught Exception:', error);
+        gracefulShutdown('UNCAUGHT_EXCEPTION');
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+        console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+        gracefulShutdown('UNHANDLED_REJECTION');
+    });
 
 }
