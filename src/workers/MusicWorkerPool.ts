@@ -79,6 +79,13 @@ export class MusicWorkerPool extends EventEmitter {
             console.error(`[WorkerPool] Searched paths:`, possiblePaths);
         }
         
+        // Additional safety check: if we somehow end up with a .ts path in production, convert it to .js
+        if (this.workerScript.endsWith('.ts') && this.workerScript.includes('/dist/')) {
+            const jsPath = this.workerScript.replace('.ts', '.js');
+            console.warn(`[WorkerPool] ⚠️ Detected .ts file in dist directory, converting to .js: ${jsPath}`);
+            this.workerScript = jsPath;
+        }
+        
         console.log(`[WorkerPool] Initializing with ${this.maxWorkers} workers`);
         this.initializeWorkers();
     }
