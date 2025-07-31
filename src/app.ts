@@ -1,6 +1,5 @@
 import {  WebSocket , WebSocketServer } from "ws";
 import cluster from "cluster";
-import http from "http"
 import dotenv from "dotenv"
 import { RoomManager } from "./managers/streamManager";
 import jwt  from "jsonwebtoken";
@@ -66,15 +65,6 @@ type Data = {
         extractedId?: string; 
         trackData?: any;
     }>;
-}
-
-
-function createHttpServer() {
-    return http.createServer((req , res)=> {
-        res.statusCode = 200;
-        res.setHeader("Content-Type" , "text/plain")
-        res.end("🎵 Deciball WebSocket Server - Optimized Music Processing System 🚀")
-    })
 }
 
 
@@ -459,11 +449,13 @@ async function handleConnection(ws:WebSocket) {
 
 
 async function main() {
-    const server = createHttpServer();
-    const wss = new WebSocketServer({server})
-    console.log("heii")
+    // Create standalone WebSocket server
+    const wss = new WebSocketServer({ port: parseInt(process.env.PORT || '8080', 10) });
+    
+    console.log("Initializing WebSocket server...")
     await RoomManager.getInstance().initRedisClient();
-    console.log("byeee")
+    console.log("Redis client initialized successfully")
+    
     wss.on("connection", (ws, req) => {
         const clientIp = req.socket.remoteAddress;
         console.log(`New WebSocket connection established from ${clientIp}`);
@@ -483,12 +475,9 @@ async function main() {
         
         handleConnection(ws);
     });
-    // wss.on("connection", (ws)=> handleConnection(ws))
 
     const PORT = process.env.PORT ?? 8080;
-    server.listen(PORT , ()=> {
-        console.log(`${process.pid} : Websocket server is running on ${PORT} `)
-    })
+    console.log(`${process.pid} : WebSocket server is running on port ${PORT}`)
 
     // Graceful shutdown handling
     const gracefulShutdown = async (signal: string) => {
@@ -498,11 +487,6 @@ async function main() {
             // Close WebSocket server
             wss.close(() => {
                 console.log('✅ WebSocket server closed');
-            });
-            
-            // Close HTTP server
-            server.close(() => {
-                console.log('✅ HTTP server closed');
             });
             
             // Shutdown RoomManager (includes worker pool and Redis)

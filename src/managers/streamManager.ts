@@ -155,7 +155,11 @@ export class RoomManager {
         
         // Initialize cache and worker pool after Redis is connected
         this.musicCache = new MusicCache(this.redisClient);
-        this.workerPool = new MusicWorkerPool(6); // 6 workers for optimal performance
+        
+        // Use optimized worker count for production stability
+        // For t2.small instances, this will automatically use 1 worker
+        // For t2.medium and larger, it will scale appropriately
+        this.workerPool = new MusicWorkerPool(); // Auto-detect optimal worker count
         
         console.log('[RoomManager] ✅ Music cache and worker pool initialized');
         
@@ -181,6 +185,19 @@ export class RoomManager {
                 console.error('[RoomManager] ❌ Health monitoring error:', error);
             }
         }, 5 * 60 * 1000); // 5 minutes
+    }
+
+    // Get worker pool statistics for monitoring
+    getWorkerPoolStats() {
+        return this.workerPool?.getStats() || {
+            totalWorkers: 0,
+            availableWorkers: 0,
+            activeWorkers: 0,
+            queuedTasks: 0,
+            totalTasksProcessed: 0,
+            averageTaskTime: 0,
+            errorRate: 0
+        };
     }
 
     // Enhanced song processing with cache + workers

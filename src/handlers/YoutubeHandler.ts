@@ -137,8 +137,10 @@ export class YoutubeHandler implements MusicHandler {
                 console.warn(`[YoutubeHandler] Empty search query provided`);
                 return null;
             }
-
-            const searchResult = await youtubesearchapi.GetListByKeyword(query.trim(), false, 1);
+            
+            const finalQuery = `${query.trim()} (Audio)`
+            console.log("Final Query 👀👀" , finalQuery)
+            const searchResult = await youtubesearchapi.GetListByKeyword(finalQuery, false, 1);
             
             if (!searchResult || !searchResult.items || searchResult.items.length === 0) {
                 console.warn(`[YoutubeHandler] No search results found for: "${query}"`);

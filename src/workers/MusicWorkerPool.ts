@@ -23,6 +23,11 @@ export interface WorkerPoolStats {
     totalTasksProcessed: number;
     averageTaskTime: number;
     errorRate: number;
+    memoryUsage?: {
+        rss: number;
+        heapUsed: number;
+        heapTotal: number;
+    };
 }
 
 export class MusicWorkerPool extends EventEmitter {
@@ -40,11 +45,39 @@ export class MusicWorkerPool extends EventEmitter {
     } = { totalProcessed: 0, totalTime: 0, errors: 0 };
 
     // Task timeout in milliseconds
-    private readonly TASK_TIMEOUT = 30000; // 30 seconds
+    private readonly TASK_TIMEOUT = parseInt(process.env.TASK_TIMEOUT || '30000', 10);
 
     constructor(maxWorkers?: number) {
         super();
-        this.maxWorkers = maxWorkers || Math.min(Math.max(os.cpus().length - 1, 2), 8);
+        // Optimize for t2.small instances - limit to 2 workers maximum
+        const cpuCount = os.cpus().length;
+        
+        // Check for environment variable override first
+        const envMaxWorkers = process.env.MAX_WORKERS ? parseInt(process.env.MAX_WORKERS, 10) : undefined;
+        const instanceType = (process.env.INSTANCE_TYPE as 't2.micro' | 't2.small' | 't2.medium' | 't3.small' | 'auto') || 'auto';
+        
+        // Priority: manual parameter > env variable > auto-detection
+        if (maxWorkers !== undefined) {
+            this.maxWorkers = Math.max(1, Math.min(maxWorkers, 4)); // Clamp between 1-4
+            console.log(`[WorkerPool] 🎯 Manual worker count override: ${this.maxWorkers} worker(s)`);
+        } else if (envMaxWorkers !== undefined && !isNaN(envMaxWorkers)) {
+            this.maxWorkers = Math.max(1, Math.min(envMaxWorkers, 4)); // Clamp between 1-4
+            console.log(`[WorkerPool] 🔧 Environment variable override: ${this.maxWorkers} worker(s)`);
+        } else {
+            // Auto-detect optimal worker count for production stability
+            this.maxWorkers = MusicWorkerPool.getOptimalWorkerCount(instanceType);
+        }
+        
+        console.log(`[WorkerPool] 🔧 CPU optimization: ${cpuCount} vCPUs detected, using ${this.maxWorkers} worker(s) (Instance: ${instanceType})`);
+        
+        // Log optimization status for different instance types
+        if (cpuCount <= 2) {
+            console.log(`[WorkerPool] ⚡ Low resource environment (t2.small/micro) - optimized for ${this.maxWorkers} worker(s)`);
+        } else if (cpuCount <= 4) {
+            console.log(`[WorkerPool] 🚀 Medium resource environment - using ${this.maxWorkers} worker(s)`);
+        } else {
+            console.log(`[WorkerPool] 💪 High resource environment - using ${this.maxWorkers} worker(s)`);
+        }
         
         // Determine the correct worker script path based on environment
         // Check multiple possible locations
@@ -402,6 +435,8 @@ export class MusicWorkerPool extends EventEmitter {
     // Get comprehensive pool statistics
     getStats(): WorkerPoolStats {
         const totalTasks = this.taskStats.totalProcessed;
+        const memUsage = process.memoryUsage();
+        
         return {
             totalWorkers: this.workers.length,
             availableWorkers: this.availableWorkers.length,
@@ -409,7 +444,12 @@ export class MusicWorkerPool extends EventEmitter {
             queuedTasks: this.taskQueue.length + this.priorityTaskQueue.length,
             totalTasksProcessed: totalTasks,
             averageTaskTime: totalTasks > 0 ? this.taskStats.totalTime / totalTasks : 0,
-            errorRate: totalTasks > 0 ? (this.taskStats.errors / totalTasks) * 100 : 0
+            errorRate: totalTasks > 0 ? (this.taskStats.errors / totalTasks) * 100 : 0,
+            memoryUsage: {
+                rss: Math.round(memUsage.rss / 1024 / 1024), // MB
+                heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024), // MB
+                heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) // MB
+            }
         };
     }
 
@@ -532,6 +572,32 @@ export class MusicWorkerPool extends EventEmitter {
                     await worker.terminate();
                 }
             }
+        }
+    }
+
+    // Quick method to set worker count optimized for different instance types
+    static getOptimalWorkerCount(instanceType: 't2.micro' | 't2.small' | 't2.medium' | 't3.small' | 'auto' = 'auto'): number {
+        const cpuCount = os.cpus().length;
+        
+        switch (instanceType) {
+            case 't2.micro':
+                return 1; // Single worker for t2.micro (1 vCPU)
+            case 't2.small':
+                return 1; // Single worker for t2.small (1 vCPU burstable to 2)
+            case 't2.medium':
+                return 2; // Two workers for t2.medium (2 vCPUs)
+            case 't3.small':
+                return 2; // Two workers for t3.small (2 vCPUs with better baseline)
+            case 'auto':
+            default:
+                // Conservative auto-detection for production stability
+                if (cpuCount <= 2) {
+                    return 1; // Low resource instances
+                } else if (cpuCount <= 4) {
+                    return 2; // Medium resource instances
+                } else {
+                    return Math.min(4, cpuCount - 1); // High resource instances, but cap at 4
+                }
         }
     }
 }
