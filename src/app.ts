@@ -38,6 +38,7 @@ type Data = {
     timestamp? : number;
     isPlaying? : boolean;
     slang? : string;
+    requestId? : string;
     // General fields
     title? : string;
     artist? : string;
@@ -367,6 +368,29 @@ async function  processUserAction(type: string , data : Data ) {
                 }
             } catch (error) {
                 console.error("Error processing latency report:", error);
+            }
+            break;
+
+        case "admin-timestamp-response":
+            // Handle admin's response with their current timestamp for new joiner sync
+            console.log(`[AdminSync] Received timestamp response from admin ${data.userId}`);
+            try {
+                if (typeof data.currentTime === 'number' && data.requestId) {
+                    await RoomManager.getInstance().handleAdminTimestampResponse(
+                        data.requestId,
+                        data.currentTime,
+                        data.isPlaying || false,
+                        data.userId
+                    );
+                } else {
+                    console.error("Invalid admin timestamp response data:", { 
+                        currentTime: data.currentTime, 
+                        requestId: data.requestId,
+                        userId: data.userId
+                    });
+                }
+            } catch (error) {
+                console.error("Error processing admin timestamp response:", error);
             }
             break;
 

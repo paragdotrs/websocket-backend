@@ -1515,7 +1515,9 @@ export class RoomManager {
 
         const now = Date.now();
         
-        // Temporarily stop broadcasts during seek
+        console.log(`[Seek] Processing seek request from user ${userId} to ${seekTime}s in space ${spaceId}`);
+        
+        // Temporarily stop broadcasts during seek - extended period
         this.stopTimestampBroadcast(spaceId);
         
         space.playbackState.startedAt = now - (seekTime * 1000);
@@ -1523,8 +1525,13 @@ export class RoomManager {
         space.playbackState.isPlaying = true;
         space.playbackState.lastUpdated = now;
 
-        // Send immediate seek command
+        console.log(`[Seek] Updated playback state - startedAt: ${space.playbackState.startedAt}, seekTime: ${seekTime}`);
+
+        // Send immediate seek command to all users except the one who initiated it
         space.users.forEach((user) => {
+            // Skip the user who initiated the seek to prevent conflicts
+            if (user.userId === userId) return;
+            
             user.ws.forEach((ws: WebSocket) => {
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({
@@ -1540,44 +1547,173 @@ export class RoomManager {
             });
         });
 
-        // Resume broadcasts after seek stabilizes
+        // Resume broadcasts after seek stabilizes - increased delay for better stability
         setTimeout(() => {
+            console.log(`[Seek] Resuming timestamp broadcasts for space ${spaceId} after seek stabilization`);
             this.startTimestampBroadcast(spaceId);
-        }, 1000); // 1 second delay
+        }, 8000); // Increased to 8 seconds to allow client-side seek to complete
     }
 
     async syncNewUserToPlayback(spaceId: string, userId: string) {
         try {
-            console.log(`[Sync] Starting playback sync for new user ${userId} in space ${spaceId}`);
+            console.log(`[Sync] Starting playbook sync for new user ${userId} in space ${spaceId}`);
             
-            // Send current song first, then sync playback state
+            const space = this.spaces.get(spaceId);
+            if (!space || !space.playbackState.currentSong) {
+                console.log(`[Sync] No current song to sync for user ${userId}`);
+                return;
+            }
+
+            // Get the admin's exact current timestamp to sync new joiner
+            await this.syncNewJoinerToAdminTimestamp(spaceId, userId);
+            
+            // Also trigger image update after a short delay
             setTimeout(async () => {
-                console.log(`[Sync] Sending timestamp sync to user ${userId}`);
-                await this.sendCurrentTimestampToUser(spaceId, userId);
-                
-                // Also trigger image update after a short delay
-                setTimeout(async () => {
-                    const imageUrl = await this.getCurrentSpaceImage(spaceId);
-                    if (imageUrl) {
-                        const user = this.users.get(userId);
-                        if (user) {
-                            user.ws.forEach((ws: WebSocket) => {
-                                if (ws.readyState === WebSocket.OPEN) {
-                                    ws.send(JSON.stringify({
-                                        type: "space-image-response",
-                                        data: { 
-                                            spaceId: spaceId,
-                                            imageUrl: imageUrl
-                                        }
-                                    }));
-                                }
-                            });
-                        }
+                const imageUrl = await this.getCurrentSpaceImage(spaceId);
+                if (imageUrl) {
+                    const user = this.users.get(userId);
+                    if (user) {
+                        user.ws.forEach((ws: WebSocket) => {
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({
+                                    type: "space-image-response",
+                                    data: { 
+                                        spaceId: spaceId,
+                                        imageUrl: imageUrl
+                                    }
+                                }));
+                            }
+                        });
                     }
-                }, 200);
-            }, 150); // Slightly longer delay to ensure song is processed first
+                }
+            }, 200);
         } catch (error) {
             console.error(`Error syncing user ${userId} to playback:`, error);
+        }
+    }
+
+    // New method to sync joiner to admin's exact timestamp without affecting others
+    async syncNewJoinerToAdminTimestamp(spaceId: string, newUserId: string) {
+        try {
+            const space = this.spaces.get(spaceId);
+            const newUser = this.users.get(newUserId);
+            
+            if (!space || !newUser || !space.creatorId) {
+                console.log(`[AdminSync] Cannot sync - missing space, user, or admin for ${spaceId}`);
+                return;
+            }
+
+            const adminUser = this.users.get(space.creatorId);
+            if (!adminUser || adminUser.ws.length === 0) {
+                console.log(`[AdminSync] Admin not found or not connected, falling back to calculated sync`);
+                await this.sendCurrentTimestampToUser(spaceId, newUserId);
+                return;
+            }
+
+            console.log(`[AdminSync] Requesting real-time timestamp from admin ${space.creatorId} for new joiner ${newUserId}`);
+
+            // Create a unique request ID to track the response
+            const requestId = `sync_${newUserId}_${Date.now()}`;
+            
+            // Store the new joiner's info for when admin responds
+            await this.redisClient.setEx(`admin-sync-request:${requestId}`, 30, JSON.stringify({
+                spaceId,
+                newUserId,
+                requestedAt: Date.now()
+            }));
+
+            // Ask admin for their current timestamp (only admin receives this)
+            adminUser.ws.forEach((ws: WebSocket) => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: "request-current-timestamp",
+                        data: {
+                            spaceId,
+                            requestId,
+                            purpose: "new-joiner-sync",
+                            newJoinerUserId: newUserId
+                        }
+                    }));
+                }
+            });
+
+            // Fallback: if admin doesn't respond within 3 seconds, use calculated sync
+            setTimeout(async () => {
+                const requestExists = await this.redisClient.exists(`admin-sync-request:${requestId}`);
+                if (requestExists) {
+                    console.log(`[AdminSync] Admin didn't respond, falling back to calculated sync for ${newUserId}`);
+                    await this.redisClient.del(`admin-sync-request:${requestId}`);
+                    await this.sendCurrentTimestampToUser(spaceId, newUserId);
+                }
+            }, 3000);
+
+        } catch (error) {
+            console.error(`[AdminSync] Error requesting admin timestamp:`, error);
+            // Fallback to regular sync
+            await this.sendCurrentTimestampToUser(spaceId, newUserId);
+        }
+    }
+
+    // Handle admin's response with their current timestamp
+    async handleAdminTimestampResponse(requestId: string, adminCurrentTime: number, adminIsPlaying: boolean, respondingUserId: string) {
+        try {
+            const requestData = await this.redisClient.get(`admin-sync-request:${requestId}`);
+            if (!requestData) {
+                console.log(`[AdminSync] Request ${requestId} expired or already handled`);
+                return;
+            }
+
+            const { spaceId, newUserId, requestedAt } = JSON.parse(requestData);
+            
+            // Clean up the request
+            await this.redisClient.del(`admin-sync-request:${requestId}`);
+
+            // Verify the response is from the actual admin
+            const space = this.spaces.get(spaceId);
+            if (!space || space.creatorId !== respondingUserId) {
+                console.log(`[AdminSync] Response from non-admin user, ignoring`);
+                return;
+            }
+
+            const newUser = this.users.get(newUserId);
+            if (!newUser) {
+                console.log(`[AdminSync] New joiner ${newUserId} no longer connected`);
+                return;
+            }
+
+            // Calculate network delay compensation
+            const responseDelay = Date.now() - requestedAt;
+            const compensatedTime = adminCurrentTime + (responseDelay / 1000); // Add network delay in seconds
+
+            console.log(`[AdminSync] Syncing new joiner ${newUserId} to admin's timestamp:`, {
+                adminTime: adminCurrentTime,
+                responseDelay,
+                compensatedTime,
+                adminIsPlaying
+            });
+
+            // Send the exact timestamp to the new joiner only
+            newUser.ws.forEach((ws: WebSocket) => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: "admin-timestamp-sync",
+                        data: {
+                            currentTime: compensatedTime,
+                            isPlaying: adminIsPlaying,
+                            timestamp: Date.now(),
+                            songId: space.playbackState.currentSong?.id,
+                            totalDuration: space.playbackState.currentSong?.duration,
+                            isInitialSync: true,
+                            syncSource: "admin-realtime"
+                        }
+                    }));
+                }
+            });
+
+            console.log(`[AdminSync] ✅ Successfully synced new joiner ${newUserId} to admin's real-time position`);
+
+        } catch (error) {
+            console.error(`[AdminSync] Error handling admin timestamp response:`, error);
         }
     }
     destroySpace(spaceId: string) {
