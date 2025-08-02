@@ -216,9 +216,10 @@ export class RoomManager {
             const { source, extractedId } = await this.extractSourceInfo(url);
             const normalizedQuery = this.normalizeQuery(url, trackData);
             
-            // 2. Check cache first (fastest path)
-            console.log(`[RoomManager] 🔍 Checking cache for: ${normalizedQuery}`);
-            const cachedSong = await this.musicCache.searchCache(normalizedQuery, source);
+            // 2. Check cache first (fastest path) - include Spotify ID if available
+            const spotifyId = trackData?.spotifyId;
+            console.log(`[RoomManager] 🔍 Checking cache for: ${normalizedQuery} ${spotifyId ? `(Spotify ID: ${spotifyId})` : ''}`);
+            const cachedSong = await this.musicCache.searchCache(normalizedQuery, source, spotifyId);
             
             if (cachedSong && !(cachedSong as any).failed) {
                 console.log(`[RoomManager] ⚡ Cache HIT: "${cachedSong.title}" (${Date.now() - processingStart}ms)`);
@@ -238,8 +239,8 @@ export class RoomManager {
             const songDetails = await this.workerPool.processSong(songData, 'high'); // High priority for real-time requests
             
             if (songDetails && !(songDetails as any).failed) {
-                // 4. Cache the result for future requests
-                await this.musicCache.cacheSong(songDetails, normalizedQuery);
+                // 4. Cache the result for future requests with Spotify ID
+                await this.musicCache.cacheSong(songDetails, normalizedQuery, spotifyId);
                 console.log(`[RoomManager] ✅ Song processed and cached: "${songDetails.title}" (${Date.now() - processingStart}ms)`);
                 
                 // 5. Add to queue
@@ -308,8 +309,8 @@ export class RoomManager {
                         const searchQuery = `${track.title} ${track.artist}`.trim();
                         console.log(`[RoomManager] 🔍 Searching YouTube for: "${searchQuery}"`);
 
-                        // Check cache first
-                        const cachedSong = await this.musicCache.searchCache(searchQuery, 'Youtube');
+                        // Check cache first with Spotify ID priority
+                        const cachedSong = await this.musicCache.searchCache(searchQuery, 'Youtube', track.spotifyId);
                         
                         let processedSong;
                         if (cachedSong && !(cachedSong as any).failed) {
@@ -367,8 +368,8 @@ export class RoomManager {
                                     spotifyUrl: track.spotifyUrl
                                 };
                                 
-                                // Cache the successful result
-                                await this.musicCache.cacheSong(processedSong, searchQuery);
+                                // Cache the successful result with Spotify ID
+                                await this.musicCache.cacheSong(processedSong, searchQuery, track.spotifyId);
                                 console.log(`[RoomManager] ✅ YouTube search successful with preserved Spotify metadata: ${processedSong.title}`);
                             }
                         }
@@ -550,8 +551,9 @@ export class RoomManager {
                         
                         const normalizedQuery = this.normalizeQuery(syntheticUrl, song.trackData);
                         
-                        // Check cache first
-                        const cachedSong = await this.musicCache.searchCache(normalizedQuery, song.source);
+                        // Check cache first with Spotify ID if available
+                        const spotifyId = song.trackData?.spotifyId || song.completeTrackData?.spotifyId;
+                        const cachedSong = await this.musicCache.searchCache(normalizedQuery, song.source, spotifyId);
                         
                         if (cachedSong && !(cachedSong as any).failed) {
                             console.log(`[RoomManager] ⚡ Cache HIT for ${isSecondary ? 'FALLBACK' : 'PRIMARY'} variation ${i + 1}: ${cachedSong.title}`);
@@ -578,8 +580,8 @@ export class RoomManager {
                         if (fetchedSong && !(fetchedSong as any).failed) {
                             console.log(`[RoomManager] ✅ Successfully fetched ${isSecondary ? 'FALLBACK' : 'PRIMARY'} variation ${i + 1}: ${fetchedSong.title}`);
                             
-                            // Cache the successful result
-                            await this.musicCache.cacheSong(fetchedSong, normalizedQuery);
+                            // Cache the successful result with Spotify ID
+                            await this.musicCache.cacheSong(fetchedSong, normalizedQuery, spotifyId);
                             
                             successfulSong = fetchedSong;
                             fetchedCount++;
@@ -1716,6 +1718,66 @@ export class RoomManager {
             console.error(`[AdminSync] Error handling admin timestamp response:`, error);
         }
     }
+
+    // Chat message broadcasting
+    async broadcastChatMessage(
+        spaceId: string, 
+        userId: string, 
+        message: string, 
+        username: string, 
+        userImage?: string, 
+        timestamp?: number
+    ) {
+        try {
+            const space = this.spaces.get(spaceId);
+            if (!space) {
+                console.log(`[Chat] Space ${spaceId} not found`);
+                return;
+            }
+
+            // Get user info to determine if they're admin
+            const user = this.users.get(userId);
+            const isAdmin = space.creatorId === userId;
+
+            // Sanitize message (basic protection)
+            const sanitizedMessage = message.trim().substring(0, 500); // Max 500 chars
+            
+            if (!sanitizedMessage) {
+                console.log(`[Chat] Empty message from user ${userId}, ignoring`);
+                return;
+            }
+
+            const chatData = {
+                id: `${Date.now()}-${userId}-${Math.random()}`,
+                userId,
+                username: username || 'Unknown User',
+                message: sanitizedMessage,
+                timestamp: timestamp || Date.now(),
+                userImage: userImage || '',
+                isAdmin,
+                spaceId
+            };
+
+            console.log(`[Chat] Broadcasting message from ${username} (${userId}) in space ${spaceId}: "${sanitizedMessage.substring(0, 50)}${sanitizedMessage.length > 50 ? '...' : ''}"`);
+
+            // Broadcast to all users in the space
+            space.users.forEach((spaceUser) => {
+                spaceUser.ws.forEach((ws: WebSocket) => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: "chat-message",
+                            data: chatData
+                        }));
+                    }
+                });
+            });
+
+            console.log(`[Chat] Message broadcasted to ${space.users.size} users in space ${spaceId}`);
+
+        } catch (error) {
+            console.error(`[Chat] Error broadcasting chat message:`, error);
+        }
+    }
     destroySpace(spaceId: string) {
         try {
             this.stopTimestampBroadcast(spaceId);
@@ -1738,12 +1800,49 @@ export class RoomManager {
                 return false;
             }
 
+            // Check if the leaving user is the admin/creator
+            const isAdmin = space.creatorId === userId;
+
             space.users.delete(userId);
 
             if (space.users.size === 0) {
                 this.stopTimestampBroadcast(spaceId);
                 this.destroySpace(spaceId);
+            } else if (isAdmin) {
+                // Admin is leaving but there are still users in the space
+                console.log(`[RoomManager] Admin ${userId} leaving space ${spaceId}, broadcasting space end`);
+                
+                // Broadcast space ended message to remaining users
+                space.users.forEach((user) => {
+                    user.ws.forEach((userWs: WebSocket) => {
+                        if (userWs.readyState === WebSocket.OPEN) {
+                            userWs.send(JSON.stringify({
+                                type: "space-ended",
+                                data: {
+                                    spaceId,
+                                    reason: "admin-left",
+                                    message: "The space admin has left. You can create a new space or join another one."
+                                }
+                            }));
+                        }
+                    });
+                });
+                
+                // Clean up the space since admin left
+                this.stopTimestampBroadcast(spaceId);
+                this.destroySpace(spaceId);
+                
+                // Clear Redis data for this space
+                try {
+                    await this.clearRedisQueue(spaceId);
+                    await this.redisClient.del(`currentSong:${spaceId}`);
+                    await this.redisClient.del(`spaceImage:${spaceId}`);
+                    await this.redisClient.del(`spaceName:${spaceId}`);
+                } catch (error) {
+                    console.error(`Error clearing Redis data for space ${spaceId}:`, error);
+                }
             } else {
+                // Regular user leaving, just broadcast user update
                 await this.broadcastUserUpdate(spaceId);
             }
 
@@ -1775,12 +1874,51 @@ export class RoomManager {
         if (spaceId && disconnectedUserId) {
             const space = this.spaces.get(spaceId);
             if (space) {
+                // Check if the disconnected user was the admin/creator
+                const wasAdmin = space.creatorId === disconnectedUserId;
+                
                 space.users.delete(disconnectedUserId);
                 
                 if (space.users.size === 0) {
                     this.stopTimestampBroadcast(spaceId);
                 } else {
-                    await this.broadcastUserUpdate(spaceId);
+                    // If admin left and there are still users, broadcast admin leave event
+                    if (wasAdmin) {
+                        console.log(`[RoomManager] Admin ${disconnectedUserId} left space ${spaceId}, broadcasting space end`);
+                        
+                        // Broadcast space ended message to remaining users
+                        space.users.forEach((user) => {
+                            user.ws.forEach((userWs: WebSocket) => {
+                                if (userWs.readyState === WebSocket.OPEN) {
+                                    userWs.send(JSON.stringify({
+                                        type: "space-ended",
+                                        data: {
+                                            spaceId,
+                                            reason: "admin-left",
+                                            message: "The space admin has left. You can create a new space or join another one."
+                                        }
+                                    }));
+                                }
+                            });
+                        });
+                        
+                        // Clean up the space since admin left
+                        this.stopTimestampBroadcast(spaceId);
+                        this.destroySpace(spaceId);
+                        
+                        // Clear Redis data for this space
+                        try {
+                            await this.clearRedisQueue(spaceId);
+                            await this.redisClient.del(`currentSong:${spaceId}`);
+                            await this.redisClient.del(`spaceImage:${spaceId}`);
+                            await this.redisClient.del(`spaceName:${spaceId}`);
+                        } catch (error) {
+                            console.error(`Error clearing Redis data for space ${spaceId}:`, error);
+                        }
+                    } else {
+                        // Regular user left, just broadcast user update
+                        await this.broadcastUserUpdate(spaceId);
+                    }
                 }
             }
         }

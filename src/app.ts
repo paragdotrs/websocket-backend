@@ -39,6 +39,10 @@ type Data = {
     isPlaying? : boolean;
     slang? : string;
     requestId? : string;
+    // Chat fields
+    message? : string;
+    username? : string;
+    userImage? : string;
     // General fields
     title? : string;
     artist? : string;
@@ -391,6 +395,31 @@ async function  processUserAction(type: string , data : Data ) {
                 }
             } catch (error) {
                 console.error("Error processing admin timestamp response:", error);
+            }
+            break;
+
+        case "send-chat-message":
+            // Handle chat message broadcasting
+            console.log(`[Chat] Received chat message from user ${data.userId}`);
+            try {
+                if (data.message && data.spaceId && data.userId) {
+                    await RoomManager.getInstance().broadcastChatMessage(
+                        data.spaceId,
+                        data.userId,
+                        data.message,
+                        data.username || 'Unknown User',
+                        data.userImage,
+                        data.timestamp || Date.now()
+                    );
+                } else {
+                    console.error("Invalid chat message data:", { 
+                        message: data.message?.substring(0, 50) + '...', 
+                        spaceId: data.spaceId,
+                        userId: data.userId
+                    });
+                }
+            } catch (error) {
+                console.error("Error processing chat message:", error);
             }
             break;
 
